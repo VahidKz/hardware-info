@@ -1,114 +1,157 @@
 #include "HardwareInfo.h"
 
-HardwareInfo::HardwareInfo()
+#include "HardwareInfo_p.h"
+
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QStringList>
+
+#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+#include <cpuid.h>
+#endif
+
+namespace
 {
-}
-
-QString  HardwareInfo::getCpuId()
+QString readTextFile(const QString &path)
 {
-    std::string   cpu_id;
-    unsigned int  s1 = 0;
-    unsigned int  s2 = 0;
-
-    asm volatile (
-        "movl $0x01, %%eax; \n\t"
-        "xorl %%edx, %%edx; \n\t"
-        "cpuid; \n\t"
-        "movl %%edx, %0; \n\t"
-        "movl %%eax, %1; \n\t"
-        : "=m" (s1), "=m" (s2));
-
-    if ((0 == s1) && (0 == s2))
-    {
-        return QString::fromStdString(cpu_id);
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
     }
 
-    char  cpu[128];
-    memset(cpu, 0, sizeof(cpu));
-    snprintf(cpu, sizeof(cpu), "%08X%08X", htonl(s2), htonl(s1));
-    cpu_id.assign(cpu);
-
-    return QString::fromStdString(cpu_id);
+    return QString::fromUtf8(file.readAll()).trimmed();
 }
 
-void  HardwareInfo::parseDiskSerial(const char *file_name, const char *match_words, std::string &serial_no)
+QString cpuSerialFromProc()
 {
-    serial_no.c_str();
-
-    std::ifstream  ifs(file_name, std::ios::binary);
-
-    if (!ifs.is_open())
-    {
-        return;
+    QFile cpuInfo(QStringLiteral("/proc/cpuinfo"));
+    if (!cpuInfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
     }
 
-    char  line[4096] = { 0 };
-
-    while (!ifs.eof())
-    {
-        ifs.getline(line, sizeof(line));
-
-        if (!ifs.good())
-        {
-            break;
-        }
-
-        const char *board = strstr(line, match_words);
-
-        if (NULL == board)
-        {
+    while (!cpuInfo.atEnd()) {
+        const QString line = QString::fromUtf8(cpuInfo.readLine());
+        const auto separator = line.indexOf(QLatin1Char(':'));
+        if (separator < 0) {
             continue;
         }
 
-        board += strlen(match_words);
+        if (line.left(separator).trimmed().compare(QStringLiteral("Serial"), Qt::CaseInsensitive) == 0) {
+            return HardwareInfoDetail::normalizeIdentifier(line.mid(separator + 1));
+        }
+    }
 
-        while ('\0' != board[0])
-        {
-            if (' ' != board[0])
-            {
-                serial_no.push_back(board[0]);
+    return {};
+}
+
+QString x86ProcessorSignature()
+{
+#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+    unsigned int eax = 0;
+    unsigned int ebx = 0;
+    unsigned int ecx = 0;
+    unsigned int edx = 0;
+
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) != 0) {
+        return QStringLiteral("%1%2")
+            .arg(eax, 8, 16, QLatin1Char('0'))
+            .arg(edx, 8, 16, QLatin1Char('0'))
+            .toUpper();
+    }
+#endif
+
+    return {};
+}
+} // namespace
+
+namespace HardwareInfoDetail
+{
+QString normalizeIdentifier(const QString &value)
+{
+    const QString normalized = value.trimmed();
+    static const QStringList invalidValues = {
+        QStringLiteral("None"),
+        QStringLiteral("Unknown"),
+        QStringLiteral("Not Specified"),
+    };
+
+    for (const QString &invalidValue : invalidValues) {
+        if (normalized.compare(invalidValue, Qt::CaseInsensitive) == 0) {
+            return {};
+        }
+    }
+
+    return normalized;
+}
+
+QString findDiskId(const QString &sysBlockPath)
+{
+    const QDir blockDevices(sysBlockPath);
+    const QStringList deviceNames =
+        blockDevices.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+
+    for (const QString &deviceName : deviceNames) {
+        if (deviceName.startsWith(QStringLiteral("loop"))
+            || deviceName.startsWith(QStringLiteral("ram"))
+            || deviceName.startsWith(QStringLiteral("zram"))
+            || deviceName.startsWith(QStringLiteral("fd"))
+            || deviceName.startsWith(QStringLiteral("sr"))) {
+            continue;
+        }
+
+        const QString devicePath = blockDevices.filePath(deviceName);
+        if (QFile::exists(QDir(devicePath).filePath(QStringLiteral("partition")))) {
+            continue;
+        }
+
+        const QStringList identifierPaths = {
+            QDir(devicePath).filePath(QStringLiteral("device/serial")),
+            QDir(devicePath).filePath(QStringLiteral("device/wwid")),
+            QDir(devicePath).filePath(QStringLiteral("wwid")),
+        };
+
+        for (const QString &identifierPath : identifierPaths) {
+            const QString identifier = normalizeIdentifier(readTextFile(identifierPath));
+            if (!identifier.isEmpty()) {
+                return identifier;
             }
-
-            ++board;
-        }
-
-        if ("None" == serial_no)
-        {
-            serial_no.clear();
-            continue;
-        }
-
-        if (!serial_no.empty())
-        {
-            break;
         }
     }
 
-    ifs.close();
+    return {};
 }
 
-QString  HardwareInfo::getDiskId()
+QString machineIdFromComponents(const QString &cpuId, const QString &diskId)
 {
-    std::string  serial_no;
-    std::string  disk_name = "/dev/sda";
-
-    serial_no.c_str();
-
-    const char *dmidecode_result = ".dmidecode_result.txt";
-    char        command[512]     = { 0 };
-    snprintf(command, sizeof(command), "udevadm info --query=all --name=%s | grep ID_SERIAL_SHORT= > %s", disk_name.c_str(), dmidecode_result);
-
-    if (0 == system(command))
-    {
-        parseDiskSerial(dmidecode_result, "ID_SERIAL_SHORT=", serial_no);
+    QStringList components;
+    if (!cpuId.isEmpty()) {
+        components.append(QStringLiteral("cpu:") + cpuId);
+    }
+    if (!diskId.isEmpty()) {
+        components.append(QStringLiteral("disk:") + diskId);
+    }
+    if (components.isEmpty()) {
+        return {};
     }
 
-    unlink(dmidecode_result);
+    const QByteArray input = components.join(QLatin1Char('\n')).toUtf8();
+    return QString::fromLatin1(QCryptographicHash::hash(input, QCryptographicHash::Sha256).toHex());
+}
+} // namespace HardwareInfoDetail
 
-    return QString::fromStdString(serial_no);
+QString HardwareInfo::getCpuId()
+{
+    const QString serial = cpuSerialFromProc();
+    return serial.isEmpty() ? x86ProcessorSignature() : serial;
 }
 
-QString  HardwareInfo::getMachineId()
+QString HardwareInfo::getDiskId()
 {
-    return getCpuId().append(getDiskId());
+    return HardwareInfoDetail::findDiskId(QStringLiteral("/sys/class/block"));
+}
+
+QString HardwareInfo::getMachineId()
+{
+    return HardwareInfoDetail::machineIdFromComponents(getCpuId(), getDiskId());
 }
