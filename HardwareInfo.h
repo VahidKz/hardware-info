@@ -1,23 +1,13 @@
-#ifndef HardwareInfo_H
-#define HardwareInfo_H
+#pragma once
+
 #include <QString>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fstream>
 
-
-class HardwareInfo
+class HardwareInfo final
 {
 public:
-    HardwareInfo();
+    HardwareInfo() = delete;
 
-    static QString  getCpuId();
-
-    static QString  getDiskId();
-
-    static QString  getMachineId();
-
-    static void     parseDiskSerial(const char *file_name, const char *match_words, std::string &serial_no);
+    [[nodiscard]] static QString getCpuId();
+    [[nodiscard]] static QString getDiskId();
+    [[nodiscard]] static QString getMachineId();
 };
-
-#endif
